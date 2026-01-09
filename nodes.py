@@ -95,6 +95,34 @@ class PackedLatentVAE:
         return getattr(self._inner, name)
 
 
+def _packed_latent_settings(vae):
+    target_channels = getattr(vae, "latent_channels", None)
+    if target_channels is None:
+        return None
+
+    first_stage = getattr(vae, "first_stage_model", None)
+    bn = getattr(first_stage, "bn", None)
+    ps = getattr(first_stage, "ps", None)
+    if bn is not None and ps is not None and len(ps) == 2 and ps[0] == ps[1]:
+        sf = ps[0]
+        if target_channels % (sf ** 2) == 0:
+            packed_channels = target_channels // (sf ** 2)
+            return packed_channels, sf
+
+    latent_dim = getattr(vae, "latent_dim", 2)
+    downscale = getattr(vae, "downscale_ratio", None)
+    upscale = getattr(vae, "upscale_ratio", None)
+    if (
+        target_channels == 128
+        and latent_dim == 2
+        and downscale in (8, 16)
+        and upscale in (8, 16)
+    ):
+        return 32, 2
+
+    return None
+
+
 def _ensure_latent_format():
     if hasattr(comfy.latent_formats, "SDXL_Flux2"):
         return comfy.latent_formats.SDXL_Flux2
@@ -179,6 +207,34 @@ def _wrap_load_state_dict_guess_config():
     comfy.sd.load_state_dict_guess_config = wrapped
 
 
+def _wrap_vae_loader():
+    loader_class = getattr(nodes, "VAELoader", None)
+    if loader_class is None:
+        return
+    if getattr(loader_class.load_vae, "_sdxl_flux2_wrapped", False):
+        return
+
+    original = loader_class.load_vae
+
+    def wrapped(self, *args, **kwargs):
+        out = original(self, *args, **kwargs)
+        if not out:
+            return out
+
+        (vae,) = out
+        settings = _packed_latent_settings(vae)
+        if settings is not None:
+            packed_channels, spatial_factor = settings
+            if hasattr(vae, "_to_vae_latent") and hasattr(vae, "set_packed_latents"):
+                vae.set_packed_latents(packed_channels, spatial_factor)
+            else:
+                vae = PackedLatentVAE(vae, packed_channels, spatial_factor)
+        return (vae,)
+
+    wrapped._sdxl_flux2_wrapped = True
+    loader_class.load_vae = wrapped
+
+
 def _apply_patches():
     global _PATCHED
     if _PATCHED:
@@ -189,6 +245,7 @@ def _apply_patches():
         model_class = _ensure_model_class()
         _ensure_model_order(model_class)
         _wrap_load_state_dict_guess_config()
+        _wrap_vae_loader()
     except Exception:
         logging.exception("SDXL Flux2 support patch failed")
 
