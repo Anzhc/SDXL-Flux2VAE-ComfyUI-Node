@@ -4,6 +4,7 @@ import comfy.latent_formats
 import comfy.model_management
 import comfy.sd
 import comfy.supported_models
+import comfy.model_detection
 import nodes
 import torch
 
@@ -235,6 +236,67 @@ def _wrap_vae_loader():
     loader_class.load_vae = wrapped
 
 
+def _wrap_unet_config_from_diffusers_unet():
+    target = comfy.model_detection.unet_config_from_diffusers_unet
+    if getattr(target, "_sdxl_flux2_wrapped", False):
+        return
+
+    original = target
+
+    def wrapped(state_dict, dtype=None):
+        unet_config = original(state_dict, dtype)
+        if unet_config is not None:
+            return unet_config
+
+        conv_in = state_dict.get("conv_in.weight", None)
+        if conv_in is None or conv_in.ndim != 4:
+            return None
+        if conv_in.shape[0] != 320 or conv_in.shape[1] != 32:
+            return None
+
+        adm_key = None
+        if "add_embedding.linear_1.weight" in state_dict:
+            adm_key = "add_embedding.linear_1.weight"
+        elif "class_embedding.linear_1.weight" in state_dict:
+            adm_key = "class_embedding.linear_1.weight"
+        if adm_key is None or state_dict[adm_key].shape[1] != 2816:
+            return None
+
+        context_key = "down_blocks.2.attentions.1.transformer_blocks.0.attn2.to_k.weight"
+        if context_key in state_dict and state_dict[context_key].shape[1] != 2048:
+            return None
+
+        sdxl_flux2 = {
+            "use_checkpoint": False,
+            "image_size": 32,
+            "out_channels": 32,
+            "use_spatial_transformer": True,
+            "legacy": False,
+            "num_classes": "sequential",
+            "adm_in_channels": 2816,
+            "dtype": dtype,
+            "in_channels": 32,
+            "model_channels": 320,
+            "num_res_blocks": [2, 2, 2],
+            "transformer_depth": [0, 0, 2, 2, 10, 10],
+            "channel_mult": [1, 2, 4],
+            "transformer_depth_middle": 10,
+            "use_linear_in_transformer": True,
+            "context_dim": 2048,
+            "num_head_channels": 64,
+            "transformer_depth_output": [0, 0, 0, 2, 2, 2, 10, 10, 10],
+            "use_temporal_attention": False,
+            "use_temporal_resblock": False,
+        }
+        cond_proj_key = "time_embedding.cond_proj.weight"
+        if cond_proj_key in state_dict:
+            sdxl_flux2["timestep_cond_dim"] = state_dict[cond_proj_key].shape[1]
+        return comfy.model_detection.convert_config(sdxl_flux2)
+
+    wrapped._sdxl_flux2_wrapped = True
+    comfy.model_detection.unet_config_from_diffusers_unet = wrapped
+
+
 def _apply_patches():
     global _PATCHED
     if _PATCHED:
@@ -246,6 +308,7 @@ def _apply_patches():
         _ensure_model_order(model_class)
         _wrap_load_state_dict_guess_config()
         _wrap_vae_loader()
+        _wrap_unet_config_from_diffusers_unet()
     except Exception:
         logging.exception("SDXL Flux2 support patch failed")
 
@@ -274,3 +337,51 @@ class EmptySDXLFlux2LatentImage:
             device=comfy.model_management.intermediate_device(),
         )
         return ({"samples": latent},)
+
+
+class TargetTimeConditioning:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "tt": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.001}),
+            },
+            "optional": {
+                "mode": (["absolute", "relative"], {"default": "absolute"}),
+                "scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
+                "debug": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply"
+    CATEGORY = "model"
+
+    def apply(self, model, tt, mode="absolute", scale=1.0, debug=False):
+        model_clone = model.clone()
+        model_clone.model_options["tt"] = tt
+        model_clone.model_options["tt_mode"] = mode
+        model_clone.model_options["tt_scale"] = scale
+        model_clone.model_options.pop("_tt_supports_timestep_cond", None)
+        model_clone.model_options.pop("_tt_debug_logged", None)
+        if debug:
+            model_clone.model_options["tt_debug"] = True
+            diffusion_model = getattr(getattr(model_clone, "model", None), "diffusion_model", None)
+            cond_proj = getattr(diffusion_model, "time_embed_cond_proj", None)
+            if cond_proj is None:
+                time_embedding = getattr(diffusion_model, "time_embedding", None)
+                cond_proj = getattr(time_embedding, "cond_proj", None) if time_embedding is not None else None
+            if cond_proj is None:
+                logging.info("TT debug: model has no time_embed_cond_proj/cond_proj")
+            else:
+                weight = cond_proj.weight
+                logging.info(
+                    "TT debug: cond_proj shape=%s absmean=%.6g max=%.6g",
+                    tuple(weight.shape),
+                    float(weight.abs().mean()),
+                    float(weight.abs().max()),
+                )
+        else:
+            model_clone.model_options.pop("tt_debug", None)
+        return (model_clone,)
