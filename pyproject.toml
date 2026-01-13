@@ -28,7 +28,7 @@ Documentation = "https://github.com/Anzhc/SDXL-Flux2VAE-ComfyUI-Node/wiki"
 "Bug Tracker" = "https://github.com/Anzhc/SDXL-Flux2VAE-ComfyUI-Node/issues"
 
 [tool.comfy]
-PublisherId = ""
+PublisherId = "anzhc"
 DisplayName = "SDXL-Flux2VAE-ComfyUI-Node"
 Icon = ""
 includes = [] 
