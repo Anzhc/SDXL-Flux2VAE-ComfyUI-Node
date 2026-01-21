@@ -16,10 +16,13 @@ class PackedLatentVAE:
         self._inner = inner
         self.packed_latent_channels = packed_channels
         self.packed_latent_spatial_factor = spatial_factor
+        self.unpack_on_encode = False
 
-    def set_packed_latents(self, packed_channels, spatial_factor=2):
+    def set_packed_latents(self, packed_channels, spatial_factor=2, unpack_on_encode=None):
         self.packed_latent_channels = packed_channels
         self.packed_latent_spatial_factor = spatial_factor
+        if unpack_on_encode is not None:
+            self.unpack_on_encode = unpack_on_encode
 
     def _to_vae_latent(self, latent):
         packed_channels = self.packed_latent_channels
@@ -42,6 +45,9 @@ class PackedLatentVAE:
         return latent
 
     def _from_vae_latent(self, latent):
+        if not self.unpack_on_encode:
+            return latent
+
         packed_channels = self.packed_latent_channels
         sf = self.packed_latent_spatial_factor
         target_channels = getattr(self._inner, "latent_channels", latent.shape[1])
@@ -200,8 +206,11 @@ def _wrap_load_state_dict_guess_config():
             spatial_factor = getattr(model_config, "packed_vae_spatial_factor", 2)
             if hasattr(vae, "_to_vae_latent") and hasattr(vae, "set_packed_latents"):
                 vae.set_packed_latents(packed_channels, spatial_factor)
+                if hasattr(vae, "unpack_on_encode"):
+                    vae.unpack_on_encode = True
             else:
                 vae = PackedLatentVAE(vae, packed_channels, spatial_factor)
+                vae.unpack_on_encode = True
         return (model, clip, vae, clipvision)
 
     wrapped._sdxl_flux2_wrapped = True
@@ -297,6 +306,76 @@ def _wrap_unet_config_from_diffusers_unet():
     comfy.model_detection.unet_config_from_diffusers_unet = wrapped
 
 
+def _pack_latents_for_model(latent, model):
+    if latent is None or "samples" not in latent:
+        return latent
+
+    try:
+        model_config = model.get_model_object("model_config")
+    except Exception:
+        model_config = getattr(getattr(model, "model", None), "model_config", None)
+
+    packed_channels = getattr(model_config, "packed_vae_latent_channels", None)
+    if not packed_channels:
+        return latent
+
+    sf = getattr(model_config, "packed_vae_spatial_factor", 2)
+    if not isinstance(sf, int) or sf <= 0:
+        return latent
+
+    samples = latent["samples"]
+    if not torch.is_tensor(samples) or samples.is_nested or samples.ndim < 4:
+        return latent
+
+    target_channels = packed_channels * (sf ** 2)
+    if samples.shape[1] != target_channels:
+        return latent
+
+    h = samples.shape[-2]
+    w = samples.shape[-1]
+    samples = samples.reshape(samples.shape[0], packed_channels, sf, sf, h, w)
+    samples = samples.permute(0, 1, 4, 2, 5, 3).reshape(samples.shape[0], packed_channels, h * sf, w * sf)
+
+    out = latent.copy()
+    out["samples"] = samples
+
+    noise_mask = latent.get("noise_mask", None)
+    if torch.is_tensor(noise_mask) and noise_mask.ndim >= 4:
+        out["noise_mask"] = torch.nn.functional.interpolate(noise_mask, scale_factor=sf, mode="nearest")
+
+    return out
+
+
+def _wrap_common_ksampler():
+    target = nodes.common_ksampler
+    if getattr(target, "_sdxl_flux2_wrapped", False):
+        return
+
+    original = target
+
+    def wrapped(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, denoise=1.0, disable_noise=False, start_step=None, last_step=None, force_full_denoise=False):
+        latent = _pack_latents_for_model(latent, model)
+        return original(
+            model,
+            seed,
+            steps,
+            cfg,
+            sampler_name,
+            scheduler,
+            positive,
+            negative,
+            latent,
+            denoise=denoise,
+            disable_noise=disable_noise,
+            start_step=start_step,
+            last_step=last_step,
+            force_full_denoise=force_full_denoise,
+        )
+
+    wrapped._sdxl_flux2_wrapped = True
+    nodes.common_ksampler = wrapped
+
+
 def _apply_patches():
     global _PATCHED
     if _PATCHED:
@@ -309,6 +388,7 @@ def _apply_patches():
         _wrap_load_state_dict_guess_config()
         _wrap_vae_loader()
         _wrap_unet_config_from_diffusers_unet()
+        _wrap_common_ksampler()
     except Exception:
         logging.exception("SDXL Flux2 support patch failed")
 
@@ -337,51 +417,3 @@ class EmptySDXLFlux2LatentImage:
             device=comfy.model_management.intermediate_device(),
         )
         return ({"samples": latent},)
-
-
-class TargetTimeConditioning:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("MODEL",),
-                "tt": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.001}),
-            },
-            "optional": {
-                "mode": (["absolute", "relative"], {"default": "absolute"}),
-                "scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
-                "debug": ("BOOLEAN", {"default": False}),
-            },
-        }
-
-    RETURN_TYPES = ("MODEL",)
-    FUNCTION = "apply"
-    CATEGORY = "model"
-
-    def apply(self, model, tt, mode="absolute", scale=1.0, debug=False):
-        model_clone = model.clone()
-        model_clone.model_options["tt"] = tt
-        model_clone.model_options["tt_mode"] = mode
-        model_clone.model_options["tt_scale"] = scale
-        model_clone.model_options.pop("_tt_supports_timestep_cond", None)
-        model_clone.model_options.pop("_tt_debug_logged", None)
-        if debug:
-            model_clone.model_options["tt_debug"] = True
-            diffusion_model = getattr(getattr(model_clone, "model", None), "diffusion_model", None)
-            cond_proj = getattr(diffusion_model, "time_embed_cond_proj", None)
-            if cond_proj is None:
-                time_embedding = getattr(diffusion_model, "time_embedding", None)
-                cond_proj = getattr(time_embedding, "cond_proj", None) if time_embedding is not None else None
-            if cond_proj is None:
-                logging.info("TT debug: model has no time_embed_cond_proj/cond_proj")
-            else:
-                weight = cond_proj.weight
-                logging.info(
-                    "TT debug: cond_proj shape=%s absmean=%.6g max=%.6g",
-                    tuple(weight.shape),
-                    float(weight.abs().mean()),
-                    float(weight.abs().max()),
-                )
-        else:
-            model_clone.model_options.pop("tt_debug", None)
-        return (model_clone,)
