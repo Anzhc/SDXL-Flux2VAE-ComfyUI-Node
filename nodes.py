@@ -1,15 +1,83 @@
 import logging
-
+import torch
+import torch.nn.functional as F
 import comfy.latent_formats
 import comfy.model_management
 import comfy.sd
 import comfy.supported_models
 import comfy.model_detection
+import comfy.ldm.modules.diffusionmodules.openaimodel
 import nodes
-import torch
+import latent_preview
+
 
 _PATCHED = False
 
+# --- PATCH SDXL MODEL FORWARD PASS ---
+# This handles the interface between Packed Latents (128ch) and the SDXL Model (32ch).
+# It wraps the execution to ensure shapes match on both ends.
+
+def _wrap_latent_preview():
+    if getattr(latent_preview, "_sdxl_flux2_preview_wrapped", False):
+        return
+
+    # Find the previewer class that uses latent_rgb_factors
+    Latent2RGBPreviewer = getattr(latent_preview, "Latent2RGBPreviewer", None)
+    if Latent2RGBPreviewer is None:
+        return
+
+    original_decode = Latent2RGBPreviewer.decode_latent_to_preview
+
+    def decode_latent_to_preview(self, x0):
+        # If latents are packed (128ch) but the format is 32ch, unpack for preview
+        try:
+            latent_channels = getattr(self.latent_format, "latent_channels", None)
+            if latent_channels == 32 and x0.shape[1] == 128:
+                x0 = F.pixel_shuffle(x0, 2)  # (N,128,H,W)->(N,32,H*2,W*2)
+        except Exception:
+            pass
+        return original_decode(self, x0)
+
+    Latent2RGBPreviewer.decode_latent_to_preview = decode_latent_to_preview
+    latent_preview._sdxl_flux2_preview_wrapped = True
+
+def _patch_unetmodel_forward():
+    if hasattr(comfy.ldm.modules.diffusionmodules.openaimodel.UNetModel, "_sdxl_flux2_patched"):
+        return
+
+    original_forward = comfy.ldm.modules.diffusionmodules.openaimodel.UNetModel.forward
+
+    def patched_forward(self, x, timesteps=None, context=None, y=None, control=None, transformer_options={}, **kwargs):
+        # Check if we have a packed input (128ch) but the model expects unpacked (32ch)
+        is_packed = False
+        if x.shape[1] == 128:
+            try:
+                # Check the weight shape of the first layer (input_blocks[0][0])
+                first_layer = self.input_blocks[0][0]
+                if hasattr(first_layer, "weight") and first_layer.weight.shape[1] == 32:
+                    is_packed = True
+            except Exception:
+                pass
+
+        # 1. PRE-PROCESS: Unpack Input (128ch -> 32ch)
+        if is_packed:
+            # (N, 128, H, W) -> (N, 32, H*2, W*2)
+            x = F.pixel_shuffle(x, 2)
+
+        # 2. RUN ORIGINAL MODEL
+        h = original_forward(self, x, timesteps, context, y, control, transformer_options, **kwargs)
+
+        # 3. POST-PROCESS: Repack Output (32ch -> 128ch)
+        if is_packed:
+            # (N, 32, H*2, W*2) -> (N, 128, H, W)
+            h = F.pixel_unshuffle(h, 2)
+
+        return h
+
+    comfy.ldm.modules.diffusionmodules.openaimodel.UNetModel.forward = patched_forward
+    comfy.ldm.modules.diffusionmodules.openaimodel.UNetModel._sdxl_flux2_patched = True
+
+# -----------------------------
 
 class PackedLatentVAE:
     def __init__(self, inner, packed_channels, spatial_factor=2):
@@ -143,6 +211,26 @@ def _ensure_latent_format():
             super().__init__()
             self.latent_rgb_factors_reshape = None
 
+            # Unpack packed latents (128ch) to 32ch *only for preview*
+            def _maybe_unpack_preview(x0, sf=2, packed_channels=128):
+                if not torch.is_tensor(x0):
+                    return x0
+                if x0.ndim == 5:
+                    # (B, C, T, H, W) -> (B*T, C, H, W) -> pixel_shuffle -> restore
+                    b, c, t, h, w = x0.shape
+                    if c == packed_channels:
+                        x0_bt = x0.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+                        x0_bt = torch.nn.functional.pixel_shuffle(x0_bt, sf)
+                        _, c2, h2, w2 = x0_bt.shape
+                        return x0_bt.reshape(b, t, c2, h2, w2).permute(0, 2, 1, 3, 4)
+                    return x0
+                if x0.ndim == 4 and x0.shape[1] == packed_channels:
+                    return torch.nn.functional.pixel_shuffle(x0, sf)
+                return x0
+
+            self.latent_rgb_factors_reshape = _maybe_unpack_preview
+
+
     comfy.latent_formats.SDXL_Flux2 = SDXL_Flux2
     return SDXL_Flux2
 
@@ -207,10 +295,11 @@ def _wrap_load_state_dict_guess_config():
             if hasattr(vae, "_to_vae_latent") and hasattr(vae, "set_packed_latents"):
                 vae.set_packed_latents(packed_channels, spatial_factor)
                 if hasattr(vae, "unpack_on_encode"):
-                    vae.unpack_on_encode = True
+                    # NOTE: Keep unpack_on_encode = False for Flux Klein Edit compatibility
+                    vae.unpack_on_encode = False
             else:
                 vae = PackedLatentVAE(vae, packed_channels, spatial_factor)
-                vae.unpack_on_encode = True
+                vae.unpack_on_encode = False
         return (model, clip, vae, clipvision)
 
     wrapped._sdxl_flux2_wrapped = True
@@ -385,10 +474,12 @@ def _apply_patches():
     try:
         model_class = _ensure_model_class()
         _ensure_model_order(model_class)
+        _patch_unetmodel_forward() # Updated Fix for SDXL Input/Output matching
         _wrap_load_state_dict_guess_config()
         _wrap_vae_loader()
         _wrap_unet_config_from_diffusers_unet()
         _wrap_common_ksampler()
+        _wrap_latent_preview()
     except Exception:
         logging.exception("SDXL Flux2 support patch failed")
 
