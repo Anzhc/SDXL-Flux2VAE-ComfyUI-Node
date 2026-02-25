@@ -434,6 +434,16 @@ def _pack_latents_for_model(latent, model):
 
     return out
 
+def _get_model_config(model):
+    try:
+        return model.get_model_object("model_config")
+    except Exception:
+        return getattr(getattr(model, "model", None), "model_config", None)
+
+def _is_sdxl_flux2_model(model):
+    model_config = _get_model_config(model)
+    return model_config is not None and model_config.__class__.__name__ == "SDXL_flux2"
+
 
 def _wrap_common_ksampler():
     target = nodes.common_ksampler
@@ -443,7 +453,14 @@ def _wrap_common_ksampler():
     original = target
 
     def wrapped(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, denoise=1.0, disable_noise=False, start_step=None, last_step=None, force_full_denoise=False):
-        latent = _pack_latents_for_model(latent, model)
+        # Explicit route: SDXL Flux2 uses the unpacked latent path.
+        # Skip latent packing and strip legacy spatial ratio hints that can
+        # cause an unintended 0.5 resize in fix_empty_latent_channels.
+        if _is_sdxl_flux2_model(model):
+            latent = latent.copy()
+            latent.pop("downscale_ratio_spacial", None)
+        else:
+            latent = _pack_latents_for_model(latent, model)
         return original(
             model,
             seed,
